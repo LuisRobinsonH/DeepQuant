@@ -1,0 +1,89 @@
+# ══════════════════════════════════════════════════════════════════
+#  BUY SCAN — Corre UNA VEZ al día, 15 minutos después de abrir ASX
+#  ASX abre: 10:00 AEDT (UTC+11 Oct-Abr) = 23:00 UTC día anterior
+#             10:00 AEST (UTC+10 Abr-Oct) = 00:00 UTC mismo día
+#  → Corre a las 23:15 UTC Dom-Jue (=10:15 AEDT Lun-Vie)
+#     Y    a las 00:15 UTC Lun-Vie (=10:15 AEST Lun-Vie como backup)
+# ══════════════════════════════════════════════════════════════════
+name: TitanBrain — Buy Scan Diario
+
+on:
+  schedule:
+    - cron: '15 23 * * 0-4'   # 23:15 UTC Dom-Jue  = 10:15 AEDT Lun-Vie (verano AU)
+    - cron: '15 0  * * 1-5'   # 00:15 UTC Lun-Vie  = 10:15 AEST Lun-Vie (invierno AU)
+  workflow_dispatch:            # también permite correrlo manualmente desde GitHub
+    inputs:
+      force:
+        description: 'Forzar aunque sea fin de semana'
+        type: boolean
+        default: false
+
+jobs:
+  buy-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Descargar código (incluye portfolio state) ──────────────
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Python 3.11 ────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Cache de dependencias pip ──────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements_ci.txt') }}
+          restore-keys: pip-
+
+      - name: Instalar dependencias
+        run: pip install -r requirements_ci.txt --quiet
+
+      # ── 4. Cache de modelos ML (se entrenan 1 vez por semana máx) ─
+      - name: Calcular semana del año
+        run: echo "WEEK=$(date +%Y-W%V)" >> $GITHUB_ENV
+
+      - name: Cache modelos ML
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: |
+            models_cache.joblib
+            features_cache.joblib
+          key: models-${{ env.WEEK }}-${{ hashFiles('train_model_2021_2025.py') }}
+          restore-keys: |
+            models-
+          
+      - name: Entrenar modelos (solo si no hay cache)
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+          echo "⚙️  Cache miss — entrenando modelos (puede tardar 10-20min)..."
+          python train_model_2021_2025.py
+
+      # ── 5. Ejecutar buy scan ───────────────────────────────────────
+      - name: Ejecutar Buy Scan
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then FLAG="--force"; fi
+          python alerts_live.py scan $FLAG
+
+      # ── 6. Guardar estado del portfolio en el repo ─────────────────
+      - name: Commit portfolio state
+        run: |
+          git config user.name  "TitanBrain Bot"
+          git config user.email "titanbot@noreply.github.com"
+          git add current_portfolio.json trade_history.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "📊 portfolio update $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push || true

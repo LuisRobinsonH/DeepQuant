@@ -1,0 +1,102 @@
+# ══════════════════════════════════════════════════════════════════
+#  EXIT MONITOR — Corre cada 15 min durante el horario ASX
+#  ASX: 10:00-16:00 AEDT (UTC+11) = 23:00-05:00 UTC
+#       10:00-16:00 AEST (UTC+10) = 00:00-06:00 UTC
+#  Cubre ambas temporadas con ventana 22:30-06:00 UTC
+#  Si portfolio está vacío: termina en <10 segundos (sin costo real)
+# ══════════════════════════════════════════════════════════════════
+name: TitanBrain — Exit Monitor (15min)
+
+on:
+  schedule:
+    # Cada 15 min — ventana 22:30 a 06:00 UTC (cubre AEDT y AEST)
+    - cron: '0,15,30,45 22 * * 0-4'   # 22:xx UTC Dom-Jue
+    - cron: '0,15,30,45 23 * * 0-4'   # 23:xx UTC Dom-Jue  ← apertura AEDT
+    - cron: '0,15,30,45  0 * * 1-5'   # 00:xx UTC Lun-Vie  ← apertura AEST
+    - cron: '0,15,30,45  1 * * 1-5'   # 01:xx UTC Lun-Vie
+    - cron: '0,15,30,45  2 * * 1-5'   # 02:xx UTC Lun-Vie
+    - cron: '0,15,30,45  3 * * 1-5'   # 03:xx UTC Lun-Vie
+    - cron: '0,15,30,45  4 * * 1-5'   # 04:xx UTC Lun-Vie
+    - cron: '0,15,30,45  5 * * 1-5'   # 05:xx UTC Lun-Vie  ← cierre AEDT
+    - cron: '0,15,30,45  6 * * 1-5'   # 06:xx UTC Lun-Vie  ← cierre AEST
+  workflow_dispatch:                    # trigger manual desde GitHub UI
+
+jobs:
+  exit-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── Salida rápida si portfolio está vacío ─────────────────────
+      - name: Verificar portfolio
+        id: check-portfolio
+        run: |
+          EMPTY=$(python -c "
+          import json, sys
+          try:
+              pf = json.load(open('current_portfolio.json'))
+              print('true' if not pf else 'false')
+          except:
+              print('true')
+          ")
+          echo "empty=$EMPTY" >> $GITHUB_OUTPUT
+
+      - name: Saltar si portfolio vacío
+        if: steps.check-portfolio.outputs.empty == 'true'
+        run: |
+          echo "✅ Portfolio vacío — nada que monitorear. Job terminado."
+          exit 0
+
+      # ── Solo si hay posiciones abiertas ───────────────────────────
+      - name: Cache pip
+        if: steps.check-portfolio.outputs.empty == 'false'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements_ci.txt') }}
+          restore-keys: pip-
+
+      - name: Instalar dependencias
+        if: steps.check-portfolio.outputs.empty == 'false'
+        run: pip install -r requirements_ci.txt --quiet
+
+      - name: Calcular semana del año
+        if: steps.check-portfolio.outputs.empty == 'false'
+        run: echo "WEEK=$(date +%Y-W%V)" >> $GITHUB_ENV
+
+      - name: Restaurar modelos ML
+        if: steps.check-portfolio.outputs.empty == 'false'
+        uses: actions/cache@v4
+        with:
+          path: |
+            models_cache.joblib
+            features_cache.joblib
+          key: models-${{ env.WEEK }}-${{ hashFiles('train_model_2021_2025.py') }}
+          restore-keys: models-
+
+      - name: Ejecutar Exit Monitor
+        if: steps.check-portfolio.outputs.empty == 'false'
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONIOENCODING: utf-8
+        run: python alerts_live.py exit-monitor
+
+      - name: Commit portfolio state
+        if: steps.check-portfolio.outputs.empty == 'false'
+        run: |
+          git config user.name  "TitanBrain Bot"
+          git config user.email "titanbot@noreply.github.com"
+          git add current_portfolio.json trade_history.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "📊 portfolio update $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push || true

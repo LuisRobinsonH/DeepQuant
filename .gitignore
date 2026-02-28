@@ -1,0 +1,45 @@
+# === ENTORNOS LOCALES ===
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+*.code-workspace
+
+# === MODELOS (demasiado grandes para git, se cachean en GitHub Actions) ===
+models_cache.joblib
+features_cache.joblib
+
+# === DATOS DE PRECIOS (se descargan en runtime) ===
+au_stock_data/
+sim_v15_data_cache.pkl
+features_cache.joblib
+
+# === OUTPUTS DE SIMULACIONES (archivos locales de análisis) ===
+sim_v*_output.txt
+sim_v*_det_*.txt
+sim_v*_baseline_*.txt
+sim_2k_*.xlsx
+sim_v*_*.xlsx
+signal_log_*.csv
+report.txt
+prob_log.txt
+reporte_alertas_*.txt
+predictions_*.xlsx
+recommendations_*.xlsx
+last_recommendations.csv
+
+# === BASE DE DATOS LOCAL ===
+trading_bot.db
+
+# === ARCHIVOS TEMPORALES ===
+.pending_buys.json
+logs/
+*.log
+debug_sim.py
+
+# === ESTADO: SÍ deben estar en git (persisten entre ejecuciones en la nube) ===
+# current_portfolio.json  → NO ignorar (estado vivo del portfolio)
+# trade_history.json      → NO ignorar (historial de trades)
+# universe_cache.json     → NO ignorar (cache de market caps, ligero)
+trade_log_*.csv
