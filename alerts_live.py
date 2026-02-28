@@ -32,10 +32,15 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 
-# ── TELEGRAM ──────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '8595554468:AAF_a9CR9zj2_352MLy6p_dHkfq20pKE_Xg')
-TELEGRAM_CHAT_ID = int(os.getenv('TELEGRAM_CHAT_ID', '6351372403'))
+# ── TELEGRAM (requiere env vars — nunca hardcodear tokens) ────────
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = int(os.getenv('TELEGRAM_CHAT_ID', '0'))
 TG_BASE          = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
+    print("[WARNING] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID no configurados como env vars.")
+    print("          En GitHub Actions: Settings → Secrets → TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
+    print("          En local: set TELEGRAM_TOKEN=... y TELEGRAM_CHAT_ID=... antes de correr")
 
 # ── PARÁMETROS v4 (idénticos a sim_2k.py) ─────────────────────────
 PROB_MOMENTUM    = 0.42
