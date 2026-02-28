@@ -492,8 +492,9 @@ def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
     today    = datetime.now().strftime('%Y-%m-%d')
     start    = (datetime.now() - timedelta(days=600)).strftime('%Y-%m-%d')
 
-    portfolio = load_portfolio()
-    signals   = []
+    portfolio  = load_portfolio()
+    signals    = []
+    near_misses = []   # candidatos con prob ≥ 0.28 aunque fallen filtros técnicos
 
     # ── Filtro de universo: solo large-caps ≥ UNIVERSE_MIN_MCAP ──────────
     active_tickers = fetch_universe(ASX_TICKERS)
@@ -553,6 +554,28 @@ def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
 
         if any(math.isnan(x) for x in [sma50_raw, sma200_raw, rsi_raw, macd_d_raw, adx_raw]):
             continue
+
+        # ── Near-miss tracking (prob >= 0.28, aunque filtros fallen) ─────
+        if prob >= 0.28:
+            _sh  = calc_shares(real_price, capital)
+            _com = calc_commission(_sh * real_price)
+            near_misses.append({
+                'ticker':      ticker,
+                'prob':        round(prob, 4),
+                'price':       real_price,
+                'rsi':         round(rsi_raw, 1),
+                'adx':         round(adx_raw, 1),
+                'macd':        'd>0' if macd_d_raw > 0 else 'd<0',
+                'vol_ratio':   round(vol_ratio, 3),
+                'mom5pct':     round(mom5 * 100, 2),
+                'above_sma50': real_price > sma50_raw,
+                'stop':        round(real_price * (1 - SL_PCT), 3),
+                'tp1':         round(real_price * (1 + TP1_PCT), 3),
+                'tp2':         round(real_price * (1 + TP2_PCT), 3),
+                'riesgo_aud':  round(_sh * real_price * SL_PCT, 2),
+                'monto_aud':   round(_sh * real_price + _com, 2),
+                'shares':      _sh,
+            })
 
         # ── FILTROS MOMENTUM v4 ───────────────────────────────────────────
         if prob >= PROB_MOMENTUM:
@@ -637,7 +660,8 @@ def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
         })
 
     print(f"\n[SCAN] Señales encontradas: {len(signals)}")
-    return sorted(signals, key=lambda x: x['score'], reverse=True)
+    near_sorted = sorted(near_misses, key=lambda x: x['prob'], reverse=True)[:10]
+    return sorted(signals, key=lambda x: x['score'], reverse=True), near_sorted
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -767,19 +791,34 @@ def send_buy_alert(signal: dict) -> None:
     emoji = '🚀' if est == 'MOMENTUM' else '🔄'
     sign_prob = '🟢' if signal['prob'] >= 0.55 else '🟡'
 
+    # ── Cálculo de capital, escenarios y Expected Value ───────────────
+    tp1_use_pct  = TP1_PCT * 0.8 if est == 'REVERSION' else TP1_PCT
+    tp2_use_pct  = signal['tp2'] / pr - 1
+    tp1_gain_aud = round(signal['shares'] * pr * tp1_use_pct - COMMISSION_FLAT, 0)
+    tp2_gain_aud = round(signal['shares'] * pr * tp2_use_pct - COMMISSION_FLAT, 0)
+    risk_aud     = signal['riesgo_aud']
+    prob_n       = signal['prob']
+    ev_tp1       = round(prob_n * tp1_gain_aud - (1 - prob_n) * risk_aud, 0)
+    pct_cap      = round(signal['monto_aud'] / CAPITAL_DEFAULT * 100, 0)
+
     text = (
         f"{emoji} <b>SEÑAL DE COMPRA — {t}</b>\n"
         f"{'━'*30}\n"
         f"{sign_prob} <b>Prob IA:</b> {signal['prob']:.1%}  |  Estrategia: {est}\n"
         f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
         f"💵 <b>Precio entrada:</b>  AUD {pr:.3f}\n"
-        f"🛑 <b>Stop Loss (-5%):</b>  AUD {signal['stop']:.3f}\n"
+        f"🛑 <b>Stop Loss (-5%):</b>  AUD {signal['stop']:.3f}"
+            f"  → riesgo <b>AUD {risk_aud:.0f}</b>\n"
         f"🔒 <b>Breakeven (+3.5%):</b> AUD {pr*1.035:.3f} → stop sube a {pr*1.015:.3f}\n"
-        f"🎯 <b>TP1 parcial (+{TP1_PCT*100:.0f}%):</b> AUD {signal['tp1']:.3f}\n"
-        f"🏆 <b>TP2 final:</b>   AUD {signal['tp2']:.3f}\n\n"
-        f"📦 <b>Posición sugerida:</b>\n"
-        f"   {signal['shares']} acciones  ≈ AUD {signal['monto_aud']:.0f}\n"
-        f"   Riesgo máximo: AUD {signal['riesgo_aud']:.0f}\n\n"
+        f"🎯 <b>TP1 parcial (+{tp1_use_pct*100:.0f}%):</b> AUD {signal['tp1']:.3f}"
+            f"  → ganancia <b>+AUD {tp1_gain_aud:.0f}</b>\n"
+        f"🏆 <b>TP2 final   (+{tp2_use_pct*100:.0f}%):</b> AUD {signal['tp2']:.3f}"
+            f"  → ganancia <b>+AUD {tp2_gain_aud:.0f}</b>\n\n"
+        f"💰 <b>Capital de tus AUD {CAPITAL_DEFAULT:.0f}:</b>\n"
+        f"   Invertir: <b>AUD {signal['monto_aud']:.0f}</b> ({pct_cap:.0f}%)"
+            f"  ×{signal['shares']} acciones\n\n"
+        f"🎲 <b>Expected Value (EV):</b> <b>+AUD {ev_tp1:.0f}</b>\n"
+        f"   (prob {prob_n:.0%} × +{tp1_gain_aud:.0f} − {1-prob_n:.0%} × {risk_aud:.0f})\n\n"
         f"📊 <b>Indicadores:</b>\n"
         f"   RSI: {ind['rsi']} | ADX: {ind['adx']} | Vol×: {ind['vol_ratio']} | Mom5d: {ind['momentum5']}%\n"
         f"   Dist SMA50: +{ind['dist_sma50']:.1f}% | MACD: {ind['macd']:.4f}"
@@ -1161,12 +1200,32 @@ def run_scan(capital: float = CAPITAL_DEFAULT, force: bool = False) -> None:
 
     # 2. Scan nuevas señales de compra
     print("\n[2/2] Escaneando señales de compra...")
-    signals = scan_buy_signals(capital=capital)
+    signals, near_misses = scan_buy_signals(capital=capital)
     for sig in signals:
         send_buy_alert(sig)
 
     if not signals and not exits:
-        print("\n[INFO] Sin alertas para hoy.")
+        print("\n[INFO] Sin señales hoy — top candidatos por probabilidad:")
+        if near_misses:
+            hdr = f"  {'Ticker':<10} {'Prob':>6} {'Precio':>8} {'Monto':>8} {'TP1':>8} {'Stop':>8} {'EV':>7}  {'RSI':>5} {'Vol×':>5} {'Mom5%':>6}  Filtros"
+            print(hdr)
+            print('  ' + '-' * (len(hdr) - 2))
+            for nm in near_misses:
+                tp1_gain = round(calc_shares(nm['price'], capital) * nm['price'] * TP1_PCT - COMMISSION_FLAT, 0)
+                ev_est   = round(nm['prob'] * tp1_gain - (1 - nm['prob']) * nm['riesgo_aud'], 0)
+                sma_ok   = '✅' if nm['above_sma50'] else '❌ SMA'
+                rsi_ok   = '✅' if nm['rsi'] < 78 else '❌ RSI'
+                macd_ok  = '✅' if nm['macd'] == 'd>0' else '❌ MACD'
+                vol_ok   = '✅' if nm['vol_ratio'] >= VOL_MIN_MOM else '❌ Vol'
+                mom_ok   = '✅' if nm['mom5pct'] >= MOM5_MIN * 100 else '❌ Mom'
+                flags    = ' '.join(f for f in [sma_ok, rsi_ok, macd_ok, vol_ok, mom_ok] if '❌' in f) or 'todos✅'
+                ev_str   = f'+{ev_est:.0f}' if ev_est >= 0 else f'{ev_est:.0f}'
+                print(f"  {nm['ticker']:<10} {nm['prob']:>6.1%} {nm['price']:>8.3f}"
+                      f" {nm['monto_aud']:>7.0f} {nm['tp1']:>8.3f} {nm['stop']:>8.3f}"
+                      f" {ev_str:>7}  {nm['rsi']:>5.1f} {nm['vol_ratio']:>5.2f} {nm['mom5pct']:>6.1f}%"
+                      f"  Falla: {flags}")
+        else:
+            print("  Sin candidatos con prob ≥ 28% en el universo de hoy.")
         return
 
     total = len(signals) + len(exits)
