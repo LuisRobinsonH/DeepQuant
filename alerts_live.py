@@ -32,15 +32,22 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 
+# ── Cargar .env local si existe (para uso local — nunca commitear .env) ────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # En CI no es necesario, las vars vienen de GitHub Secrets
+
 # ── TELEGRAM (requiere env vars — nunca hardcodear tokens) ────────
-TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')
-TELEGRAM_CHAT_ID = int(os.getenv('TELEGRAM_CHAT_ID', '0'))
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN') or ''
+TELEGRAM_CHAT_ID = int(os.getenv('TELEGRAM_CHAT_ID') or '0')
 TG_BASE          = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
-    print("[WARNING] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID no configurados como env vars.")
-    print("          En GitHub Actions: Settings → Secrets → TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
-    print("          En local: set TELEGRAM_TOKEN=... y TELEGRAM_CHAT_ID=... antes de correr")
+    print("[WARNING] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID no configurados.")
+    print("          Local: crea un archivo .env con TELEGRAM_TOKEN=... y TELEGRAM_CHAT_ID=...")
+    print("          CI: configura los secretos en GitHub Actions.")
 
 # ── PARÁMETROS v4 (idénticos a sim_2k.py) ─────────────────────────
 PROB_MOMENTUM    = 0.42
