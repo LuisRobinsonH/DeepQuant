@@ -1,6 +1,7 @@
 # === ENTORNOS LOCALES ===
 .venv/
 __pycache__/
+.env
 *.pyc
 *.pyo
 .vscode/

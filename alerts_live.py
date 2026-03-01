@@ -1,6 +1,22 @@
+import threading
+import time
+
+def monitor_alerts(interval=60):
+    print("[MONITOR] Iniciando monitor de alertas en tiempo real...")
+    while True:
+        print("[MONITOR] Escaneando señales...")
+        scan_buy_signals()
+        time.sleep(interval)
+
+def start_monitor():
+    t = threading.Thread(target=monitor_alerts, args=(60,), daemon=True)
+    t.start()
 """
-alerts_live.py — TitanBrain Live Alert System (v4)
+alerts_live.py — TitanBrain Live Alert System (V37)
 ────────────────────────────────────────────────────
+MODELO: V37 — 16/17 años PASS | +290.84% compuesto | $8k→$31,267
+VALIDADO: walk-forward 2008-2026 (17 períodos anuales independientes)
+
 MODOS:
   python alerts_live.py          → escanea señales + monitorea portfolio → envía Telegram
   python alerts_live.py bot      → bot continuo (polling) que procesa confirmaciones
@@ -14,10 +30,15 @@ FLUJO:
   3. Monitor diario detecta EXIT → Telegram con botón [✅ Vendí | 🔄 Mantener]
   4. Usuario pulsa ✅ Vendí   → posición sale del portfolio + log P&L
 
-Usa EXACTAMENTE los mismos filtros v4 de sim_2k.py:
-  - prob ≥ 0.42 (MOMENTUM), ≥ 0.33 (REVERSION)
-  - SMA50/SMA200, RSI<78, MACD>0, ADX≥15, vol_ratio≥1.20, mom5≥1.5%
-  - Breakeven lock: +3.5% → stop a +1.5% (con gracia ≥2 días)
+Filtros V37 (SOLO BULL — sin REVERSION):
+  - prob ≥ 0.52 (BULL_PROB_FULL, gate LightGBM)
+  - Golden Cross exacto: SMA50 > SMA200
+  - dist_SMA200 ≥ +2% (precio bien sobre la media larga)
+  - Gate 3m: precio actual > precio hace 63 días (momentum positivo)
+  - RSI < 78, MACD > 0, ADX ≥ 15, vol_ratio ≥ 1.20, mom5 ≥ 1.5%
+  - Stop ATR: entry − 2.5×ATR14  |  Breakeven: entry + 1.5×ATR14
+  - Sizing dinámico: frac = prob / 0.90 (mín 33% capital, máx 100%)
+  - MAX_HOLD: 35 días  |  STOP_COOLDOWN: 5 días post stop-loss
 """
 
 import sys, os, json, time, math
@@ -49,18 +70,25 @@ if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
     print("          Local: crea un archivo .env con TELEGRAM_TOKEN=... y TELEGRAM_CHAT_ID=...")
     print("          CI: configura los secretos en GitHub Actions.")
 
-# ── PARÁMETROS v4 (idénticos a sim_2k.py) ─────────────────────────
-PROB_MOMENTUM    = 0.42
-PROB_REVERSION   = 0.33
-SL_PCT           = 0.05
+# ── PARÁMETROS V37 (validados walk-forward 2008-2026, 16/17 PASS, +290.84%) ──
+# Entrada (solo BULL — sin tier REVERSION)
+PROB_MOMENTUM    = 0.52        # BULL_PROB_FULL: umbral mínimo de prob para BULL
+PROB_SIZE_MIN    = 0.30        # fracción mínima de capital (30%)
+PROB_SIZE_MAX    = 0.90        # fracción máxima de capital (90%) → sizing dinámico
+# Stop / Breakeven ATR-based
+SL_ATR           = 2.5         # stop = entry − SL_ATR × ATR14
+BE_TRIGGER_ATR   = 1.5         # breakeven trigger = entry + BE_TRIGGER_ATR × ATR14
+# Targets indicativos (para Telegram — el sistema sale por stop/BE/max-hold)
 TP1_PCT          = 0.09
 TP2_PCT          = 0.22
-BREAKEVEN_PCT    = 0.035
-BREAKEVEN_LOCK   = 0.015
-VOL_MIN_MOM      = 1.20
-MOM5_MIN         = 0.015
-MAX_HOLD_DAYS    = 20
-MAX_POS_PCT      = 0.28
+# Filtros técnicos de entrada
+VOL_MIN_MOM      = 1.20        # vol_ratio mínimo
+MOM5_MIN         = 0.015       # mom5d mínimo (+1.5%)
+# Gestión de posición
+MAX_HOLD_DAYS    = 35          # máximo días en posición
+MIN_POSITION     = 3000        # AUD mínimo por operación
+STOP_COOLDOWN_DAYS = 5         # días de enfriamiento tras stop-loss por ticker
+MAX_POS_PCT      = 0.90        # límite máximo de capital en una posición
 CAPITAL_DEFAULT  = 8000.0
 COMMISSION_FLAT  = 10.0
 COMMISSION_RATE  = 0.0011
@@ -259,19 +287,49 @@ def calc_commission(gross: float) -> float:
     return max(COMMISSION_FLAT, gross * COMMISSION_RATE)
 
 
-def calc_shares(price: float, capital: float = CAPITAL_DEFAULT) -> int:
-    """Half-Kelly conservador (sin historial = 20%) limitado a MAX_POS_PCT"""
-    kf           = 0.20
-    risk_amount  = capital * kf
-    shares_kelly = int(risk_amount / (price * SL_PCT))
-    shares_cap   = int((capital * MAX_POS_PCT) / price)
-    return max(1, min(shares_kelly, shares_cap))
+# ── STOP COOLDOWN HISTORY (V37) ───────────────────────────────────
+STOP_HISTORY_FILE = 'stop_history.json'
+
+def _load_stop_history() -> dict:
+    """Carga historial de stop-loss {ticker: 'YYYY-MM-DD'}."""
+    if os.path.exists(STOP_HISTORY_FILE):
+        try:
+            with open(STOP_HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_stop_history(hist: dict) -> None:
+    with open(STOP_HISTORY_FILE, 'w') as f:
+        json.dump(hist, f, indent=2)
+
+def record_stop_loss(ticker: str) -> None:
+    """Registra fecha de hoy como último stop-loss para el ticker."""
+    hist = _load_stop_history()
+    hist[ticker] = datetime.now().strftime('%Y-%m-%d')
+    _save_stop_history(hist)
+
+
+
+def calc_shares(price: float, capital: float = CAPITAL_DEFAULT,
+                prob: float = PROB_SIZE_MAX) -> int:
+    """
+    Sizing dinámico V37: posición = capital × (prob / PROB_SIZE_MAX).
+    Mínimo MIN_POSITION AUD, máximo capital×MAX_POS_PCT.
+    """
+    frac         = max(PROB_SIZE_MIN, min(PROB_SIZE_MAX, prob)) / PROB_SIZE_MAX
+    position_aud = max(MIN_POSITION, capital * frac)
+    position_aud = min(position_aud, capital * MAX_POS_PCT)
+    return max(1, int(position_aud / price))
 
 
 def add_position(ticker: str, price: float, shares: int,
                  stop: float, tp1: float, tp2: float,
                  estrategia: str, indicadores: dict,
-                 capital: float = CAPITAL_DEFAULT) -> None:
+                 capital: float = CAPITAL_DEFAULT,
+                 atr_entry: float = 0.0,
+                 be_target: float = 0.0) -> None:
     """Agrega posición al portfolio."""
     pf = load_portfolio()
     comm = calc_commission(shares * price)
@@ -283,6 +341,8 @@ def add_position(ticker: str, price: float, shares: int,
         'stop':        round(stop, 3),
         'tp1':         round(tp1, 3),
         'tp2':         round(tp2, 3),
+        'atr_entry':   round(atr_entry, 4),
+        'be_target':   round(be_target, 3),
         'estrategia':  estrategia,
         'be_lock':     False,
         'tp1_hit':     False,
@@ -489,9 +549,27 @@ def engineer(raw_df: pd.DataFrame) -> pd.DataFrame | None:
 
 def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
     """
-    Escanea todos los tickers con los mismos filtros v4.
+    Escanea todos los tickers con los mismos filtros V37.
     Retorna lista de señales ordenadas por score.
     """
+    # ── Config personalizada (user_alert_config.json override) ───────
+    import csv
+    user_config_file = "user_alert_config.json"
+    def get_user_config():
+        if os.path.exists(user_config_file):
+            with open(user_config_file, "r") as f:
+                return json.load(f)
+        return {"prob_min": PROB_MOMENTUM, "rsi_max": 78, "vol_max": 2.0}
+    user_config = get_user_config()
+
+    # ── Log de alertas históricas ─────────────────────────────────────
+    alert_history_file = "alert_history.csv"
+    def log_alert(ticker, prob, price, rsi, adx, macd, vol_ratio, mom5, sma50, sma200):
+        with open(alert_history_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([datetime.now().isoformat(), ticker, prob, price,
+                             rsi, adx, macd, vol_ratio, mom5, sma50, sma200])
+
     if not os.path.exists(MODEL_CACHE_FILE) or not os.path.exists(FEATURE_CACHE_FILE):
         print("[ERROR] No se encontró models_cache.joblib. Ejecuta primero train_model_2021_2025.py")
         return []
@@ -563,14 +641,27 @@ def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
         mom5       = float(raw_close.pct_change(5).iloc[-1])
         atr_now    = float(ta_lib.volatility.average_true_range(
             raw_slice['high'], raw_slice['low'], raw_close, 14).iloc[-1])
+        # Gate 3m: precio actual > precio hace 63 días (slope positivo)
+        gate_3m    = bool(len(raw_close) >= 63 and real_price > float(raw_close.iloc[-63]))
 
         if any(math.isnan(x) for x in [sma50_raw, sma200_raw, rsi_raw, macd_d_raw, adx_raw]):
             continue
 
-        # ── Near-miss tracking (prob >= 0.28, aunque filtros fallen) ─────
-        if prob >= 0.28:
-            _sh  = calc_shares(real_price, capital)
+        # ── STOP_COOLDOWN V37: saltar si el ticker tuvo stop-loss reciente ─
+        cooldown_hist = _load_stop_history()
+        if ticker in cooldown_hist:
+            try:
+                last_stop_dt = datetime.strptime(cooldown_hist[ticker], '%Y-%m-%d')
+                if (datetime.now() - last_stop_dt).days < STOP_COOLDOWN_DAYS:
+                    continue
+            except Exception:
+                pass
+
+        # ── Near-miss tracking (prob >= 0.42, aunque filtros fallen) ─────
+        if prob >= 0.42:
+            _sh  = calc_shares(real_price, capital, prob)
             _com = calc_commission(_sh * real_price)
+            _sl  = round(real_price - SL_ATR * atr_now, 3)
             near_misses.append({
                 'ticker':      ticker,
                 'prob':        round(prob, 4),
@@ -581,52 +672,54 @@ def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
                 'vol_ratio':   round(vol_ratio, 3),
                 'mom5pct':     round(mom5 * 100, 2),
                 'above_sma50': real_price > sma50_raw,
-                'stop':        round(real_price * (1 - SL_PCT), 3),
+                'stop':        _sl,
                 'tp1':         round(real_price * (1 + TP1_PCT), 3),
                 'tp2':         round(real_price * (1 + TP2_PCT), 3),
-                'riesgo_aud':  round(_sh * real_price * SL_PCT, 2),
+                'riesgo_aud':  round(_sh * (real_price - _sl), 2),
                 'monto_aud':   round(_sh * real_price + _com, 2),
                 'shares':      _sh,
             })
 
-        # ── FILTROS MOMENTUM v4 ───────────────────────────────────────────
-        if prob >= PROB_MOMENTUM:
-            if real_price <= sma50_raw          : continue
-            if sma50_raw < sma200_raw * 0.95    : continue
-            if rsi_raw >= 78                    : continue
-            if macd_d_raw <= 0                  : continue
-            if adx_raw < 15                     : continue
-            if vol_ratio < VOL_MIN_MOM          : continue
-            if mom5 < MOM5_MIN                  : continue
-            estrategia = 'MOMENTUM'
-            score = prob * (1.0 + max(0.0, min(1.0, mom5 * 15)))
+        # ── FILTROS BULL V37 (pure MOMENTUM — sin tier REVERSION) ────────
+        if prob >= user_config.get("prob_min", PROB_MOMENTUM):
+            # Golden Cross exacto: SMA50 debe superar SMA200
+            if sma50_raw <= sma200_raw                      : continue
+            # Precio bien posicionado: dist_SMA200 ≥ +2%
+            if real_price < sma200_raw * 1.02               : continue
+            # Gate 3m: slope positivo en 63 días
+            if not gate_3m                                   : continue
+            # Filtros técnicos estándar
+            if rsi_raw >= user_config.get("rsi_max", 78)    : continue
+            if macd_d_raw <= 0                               : continue
+            if adx_raw < 15                                  : continue
+            if vol_ratio < VOL_MIN_MOM                       : continue
+            if mom5 < MOM5_MIN                               : continue
 
-        # ── FILTROS REVERSION ─────────────────────────────────────────────
-        elif prob >= PROB_REVERSION:
-            near_support = real_price >= sma200_raw * 0.92 and real_price <= sma200_raw * 1.08
-            macd_turning = macd_d_raw > -0.05 * real_price * 0.001
-            if rsi_raw >= 38                    : continue
-            if not near_support                 : continue
-            if not macd_turning                 : continue
-            if vol_ratio < 0.8                  : continue
-            if adx_raw > 35                     : continue
-            estrategia = 'REVERSION'
-            score = prob * 0.85 * (1.0 + max(0.0, min(0.5, (38 - rsi_raw) / 38)))
+            print(f"[ALERTA V37] {ticker} | Prob: {prob:.3f} | Precio: {real_price:.2f} | "
+                  f"RSI: {rsi_raw:.1f} | ADX: {adx_raw:.1f} | "
+                  f"MACD: {'d>0' if macd_d_raw > 0 else 'd<0'} | "
+                  f"VolRatio: {vol_ratio:.3f} | Mom5: {mom5*100:.2f}% | "
+                  f"SMA50: {sma50_raw:.2f} | SMA200: {sma200_raw:.2f} | "
+                  f"Gate3m: {gate_3m}")
+            log_alert(ticker, prob, real_price, rsi_raw, adx_raw,
+                      'd>0' if macd_d_raw > 0 else 'd<0',
+                      vol_ratio, mom5*100, sma50_raw, sma200_raw)
+            estrategia = 'BULL_V37'
+            score = prob * (1.0 + max(0.0, min(1.0, mom5 * 15)))
 
         else:
             continue
 
-        # ── Calcular stops y targets ─────────────────────────────────────
-        if estrategia == 'REVERSION':
-            tp1_use = TP1_PCT * 0.8
-            tp2_use = max(TP2_PCT * 0.75, (atr_now / real_price) * 2.5)
-        else:
-            tp1_use = TP1_PCT
-            tp2_use = max(TP2_PCT, (atr_now / real_price) * 3.5)
+        # ── Calcular stops ATR-based V37 ──────────────────────────────────
+        stop_atr  = round(real_price - SL_ATR * atr_now, 3)
+        be_target = round(real_price + BE_TRIGGER_ATR * atr_now, 3)   # trigger breakeven
+        tp1_use   = TP1_PCT
+        tp2_use   = max(TP2_PCT, (atr_now / real_price) * 3.5)
 
-        shares    = calc_shares(real_price, capital)
+        shares    = calc_shares(real_price, capital, prob)
         comm      = calc_commission(shares * real_price)
         monto_aud = round(shares * real_price + comm, 2)
+        riesgo_aud = round(shares * (real_price - stop_atr), 2)
 
         # ── Nota de timing intradía basada en VWAP de la sesión ──────────
         entry_note = ''
@@ -651,12 +744,14 @@ def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
             'score':      round(score, 4),
             'price':      real_price,
             'prob':       round(prob, 4),
-            'stop':       round(real_price * (1 - SL_PCT), 3),
+            'stop':       stop_atr,
+            'be_target':  be_target,
             'tp1':        round(real_price * (1 + tp1_use), 3),
             'tp2':        round(real_price * (1 + tp2_use), 3),
+            'atr_entry':  round(atr_now, 4),
             'shares':     shares,
             'monto_aud':  monto_aud,
-            'riesgo_aud': round(shares * real_price * SL_PCT, 2),
+            'riesgo_aud': riesgo_aud,
             'indicadores': {
                 'prob':      round(prob, 4),
                 'rsi':       round(rsi_raw, 1),
@@ -666,6 +761,8 @@ def scan_buy_signals(capital: float = CAPITAL_DEFAULT) -> list[dict]:
                 'dist_sma50':  round((real_price / sma50_raw - 1) * 100, 2),
                 'dist_sma200': round((real_price / sma200_raw - 1) * 100, 2),
                 'momentum5': round(mom5 * 100, 2),
+                'gate_3m':   gate_3m,
+                'atr':       round(atr_now, 4),
             },
             'entry_note': entry_note,
             'vwap':       round(vwap_val, 3) if vwap_val else None,
@@ -717,21 +814,22 @@ def check_portfolio_exits() -> list[dict]:
         tp1_hit    = pos.get('tp1_hit', False)
         unrealized = (price_now - buy_price) / buy_price
 
-        # 1. Actualizar Breakeven lock
-        if not be_lock and hold_days >= 2 and price_now >= buy_price * (1 + BREAKEVEN_PCT):
-            new_stop = max(stop, buy_price * (1 + BREAKEVEN_LOCK))
+        # 1. Actualizar Breakeven lock V37 (ATR-based trigger)
+        be_trigger = float(pos.get('be_target', 0.0)) or buy_price * 1.035
+        if not be_lock and hold_days >= 2 and (price_now >= be_trigger or today_high >= be_trigger):
+            new_stop = max(stop, buy_price)    # mover stop a break-even (entrada)
             portfolio[ticker]['stop'] = round(new_stop, 3)
             portfolio[ticker]['be_lock'] = True
             be_lock = True
             updated = True
-            print(f"[BE LOCK] {ticker}: stop movido a AUD {new_stop:.3f} (+{BREAKEVEN_LOCK*100:.1f}%)")
+            print(f"[BE LOCK V37] {ticker}: stop → AUD {new_stop:.3f} (entrada) | trigger era {be_trigger:.3f}")
 
         # 2. TP1 hit → registrar, stop sube a breakeven (incluyendo toque intradía)
         if not tp1_hit and (price_now >= tp1 or today_high >= tp1):
             portfolio[ticker]['tp1_hit'] = True
             tp1_hit = True
             if not be_lock:
-                portfolio[ticker]['stop'] = round(max(stop, buy_price * (1 + BREAKEVEN_LOCK)), 3)
+                portfolio[ticker]['stop'] = round(max(stop, buy_price), 3)
                 portfolio[ticker]['be_lock'] = True
                 be_lock = True
             updated = True
@@ -743,6 +841,7 @@ def check_portfolio_exits() -> list[dict]:
         if price_now <= stop or today_low <= stop:
             razon    = 'STOP_LOSS'
             urgencia = 'urgente'
+            record_stop_loss(ticker)   # V37: cooldown 5 días
 
         # 4. TP2 hit (precio actual O máximo intradía superó TP2)
         elif price_now >= tp2 or today_high >= tp2:
@@ -804,7 +903,7 @@ def send_buy_alert(signal: dict) -> None:
     sign_prob = '🟢' if signal['prob'] >= 0.55 else '🟡'
 
     # ── Cálculo de capital, escenarios y Expected Value ───────────────
-    tp1_use_pct  = TP1_PCT * 0.8 if est == 'REVERSION' else TP1_PCT
+    tp1_use_pct  = TP1_PCT
     tp2_use_pct  = signal['tp2'] / pr - 1
     tp1_gain_aud = round(signal['shares'] * pr * tp1_use_pct - COMMISSION_FLAT, 0)
     tp2_gain_aud = round(signal['shares'] * pr * tp2_use_pct - COMMISSION_FLAT, 0)
@@ -812,16 +911,19 @@ def send_buy_alert(signal: dict) -> None:
     prob_n       = signal['prob']
     ev_tp1       = round(prob_n * tp1_gain_aud - (1 - prob_n) * risk_aud, 0)
     pct_cap      = round(signal['monto_aud'] / CAPITAL_DEFAULT * 100, 0)
+    atr_val      = signal.get('atr_entry', 0.0)
+    be_tgt       = signal.get('be_target', round(pr * 1.035, 3))
+    sl_pct       = round((pr - signal['stop']) / pr * 100, 1) if pr > 0 else 5.0
 
     text = (
-        f"{emoji} <b>SEÑAL DE COMPRA — {t}</b>\n"
+        f"{emoji} <b>SEÑAL V37 — {t}</b>\n"
         f"{'━'*30}\n"
-        f"{sign_prob} <b>Prob IA:</b> {signal['prob']:.1%}  |  Estrategia: {est}\n"
+        f"{sign_prob} <b>Prob IA:</b> {signal['prob']:.1%}  |  Modelo: {est}\n"
         f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
         f"💵 <b>Precio entrada:</b>  AUD {pr:.3f}\n"
-        f"🛑 <b>Stop Loss (-5%):</b>  AUD {signal['stop']:.3f}"
-            f"  → riesgo <b>AUD {risk_aud:.0f}</b>\n"
-        f"🔒 <b>Breakeven (+3.5%):</b> AUD {pr*1.035:.3f} → stop sube a {pr*1.015:.3f}\n"
+        f"🛑 <b>Stop ATR (2.5×ATR={atr_val:.3f}):</b>  AUD {signal['stop']:.3f}"
+            f"  → riesgo <b>AUD {risk_aud:.0f}</b> (−{sl_pct:.1f}%)\n"
+        f"🔒 <b>Break-even (+1.5×ATR):</b> AUD {be_tgt:.3f} → stop → entrada\n"
         f"🎯 <b>TP1 parcial (+{tp1_use_pct*100:.0f}%):</b> AUD {signal['tp1']:.3f}"
             f"  → ganancia <b>+AUD {tp1_gain_aud:.0f}</b>\n"
         f"🏆 <b>TP2 final   (+{tp2_use_pct*100:.0f}%):</b> AUD {signal['tp2']:.3f}"
@@ -834,6 +936,7 @@ def send_buy_alert(signal: dict) -> None:
         f"📊 <b>Indicadores:</b>\n"
         f"   RSI: {ind['rsi']} | ADX: {ind['adx']} | Vol×: {ind['vol_ratio']} | Mom5d: {ind['momentum5']}%\n"
         f"   Dist SMA50: +{ind['dist_sma50']:.1f}% | MACD: {ind['macd']:.4f}"
+        f" | Gate3m: {'✅' if ind.get('gate_3m') else '❌'}"
     )
     entry_note = signal.get('entry_note', '')
     vwap_val   = signal.get('vwap')
@@ -979,6 +1082,8 @@ def process_callback(update: dict) -> None:
                 tp2         = signal['tp2'],
                 estrategia  = signal['estrategia'],
                 indicadores = signal['indicadores'],
+                atr_entry   = signal.get('atr_entry', 0.0),
+                be_target   = signal.get('be_target', 0.0),
             )
             _remove_pending_buy(ticker)
             tg_answer_callback(cq_id, f"✅ {ticker} agregado al portfolio")
@@ -1223,7 +1328,7 @@ def run_scan(capital: float = CAPITAL_DEFAULT, force: bool = False) -> None:
             print(hdr)
             print('  ' + '-' * (len(hdr) - 2))
             for nm in near_misses:
-                tp1_gain = round(calc_shares(nm['price'], capital) * nm['price'] * TP1_PCT - COMMISSION_FLAT, 0)
+                tp1_gain = round(calc_shares(nm['price'], capital, nm['prob']) * nm['price'] * TP1_PCT - COMMISSION_FLAT, 0)
                 ev_est   = round(nm['prob'] * tp1_gain - (1 - nm['prob']) * nm['riesgo_aud'], 0)
                 sma_ok   = '✅' if nm['above_sma50'] else '❌ SMA'
                 rsi_ok   = '✅' if nm['rsi'] < 78 else '❌ RSI'
@@ -1252,12 +1357,11 @@ if __name__ == '__main__':
         ticker     = args[1].upper()
         price      = float(args[2])
         shares     = int(args[3]) if len(args) > 3 else calc_shares(price)
-        estrategia = args[4].upper() if len(args) > 4 else 'MOMENTUM'
-        stop       = round(price * (1 - SL_PCT),  3)
-        tp1_use    = TP1_PCT * 0.8 if estrategia == 'REVERSION' else TP1_PCT
-        tp2_use    = TP2_PCT * 0.75 if estrategia == 'REVERSION' else TP2_PCT
-        tp1        = round(price * (1 + tp1_use), 3)
-        tp2        = round(price * (1 + tp2_use), 3)
+        estrategia = args[4].upper() if len(args) > 4 else 'BULL_V37'
+        # Stop manual: 5% fijo (sin ATR disponible en CLI)
+        stop       = round(price * 0.95, 3)
+        tp1        = round(price * (1 + TP1_PCT), 3)
+        tp2        = round(price * (1 + TP2_PCT), 3)
         comm       = calc_commission(shares * price)
         signal = {
             'ticker':     ticker,
@@ -1266,11 +1370,13 @@ if __name__ == '__main__':
             'price':      price,
             'prob':       0,
             'stop':       stop,
+            'be_target':  round(price * 1.035, 3),
             'tp1':        tp1,
             'tp2':        tp2,
+            'atr_entry':  0.0,
             'shares':     shares,
             'monto_aud':  round(shares * price + comm, 2),
-            'riesgo_aud': round(shares * price * SL_PCT, 2),
+            'riesgo_aud': round(shares * price * 0.05, 2),
             'indicadores': {},
         }
         send_buy_alert(signal)
