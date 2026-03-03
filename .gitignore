@@ -39,8 +39,9 @@ logs/
 *.log
 debug_sim.py
 
-# === ESTADO: SÍ deben estar en git (persisten entre ejecuciones en la nube) ===
-# current_portfolio.json  → NO ignorar (estado vivo del portfolio)
-# trade_history.json      → NO ignorar (historial de trades)
-# universe_cache.json     → NO ignorar (cache de market caps, ligero)
+# === ESTADO PRIVADO (NO publicar en git) ===
+current_portfolio.json
+trade_history.json
+stop_history.json
+# universe_cache.json puede permanecer versionado (no contiene datos sensibles)
 trade_log_*.csv

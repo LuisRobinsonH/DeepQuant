@@ -36,6 +36,26 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Restaurar estado privado (portfolio/trades)
+        id: restore-state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            current_portfolio.json
+            trade_history.json
+            stop_history.json
+            .pending_buys.json
+          key: portfolio-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            portfolio-state-${{ github.ref_name }}-
+
+      - name: Inicializar archivos de estado si faltan
+        run: |
+          [ -f current_portfolio.json ] || echo '{}' > current_portfolio.json
+          [ -f trade_history.json ] || echo '[]' > trade_history.json
+          [ -f stop_history.json ] || echo '{}' > stop_history.json
+          [ -f .pending_buys.json ] || echo '{}' > .pending_buys.json
+
       # ── 3. Cache de dependencias pip ──────────────────────────────
       - name: Cache pip
         uses: actions/cache@v4
@@ -79,11 +99,14 @@ jobs:
           if [ "${{ github.event.inputs.force }}" = "true" ]; then FLAG="--force"; fi
           python alerts_live.py scan $FLAG
 
-      # ── 6. Guardar estado del portfolio en el repo ─────────────────
-      - name: Commit portfolio state
-        run: |
-          git config user.name  "TitanBrain Bot"
-          git config user.email "titanbot@noreply.github.com"
-          git add current_portfolio.json trade_history.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "📊 portfolio update $(date -u '+%Y-%m-%d %H:%M UTC')"
-          git push || true
+      # ── 6. Guardar estado privado (sin publicar en git) ───────────
+      - name: Guardar estado privado (cache)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            current_portfolio.json
+            trade_history.json
+            stop_history.json
+            .pending_buys.json
+          key: portfolio-state-${{ github.ref_name }}-${{ github.run_id }}
