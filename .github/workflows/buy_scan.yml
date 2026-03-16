@@ -96,6 +96,7 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           FLAG=""
+          if [ "${{ github.event_name }}" = "schedule" ]; then FLAG="--force"; fi
           if [ "${{ github.event.inputs.force }}" = "true" ]; then FLAG="--force"; fi
           python alerts_live.py scan $FLAG
 

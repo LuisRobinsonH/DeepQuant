@@ -209,6 +209,13 @@ ASX_TICKERS = [
 
 def tg_send(text: str, reply_markup=None) -> dict:
     """Envía mensaje Telegram. Retorna la respuesta JSON."""
+    if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
+        return {
+            'ok': False,
+            'error': 'telegram_not_configured',
+            'description': 'TELEGRAM_TOKEN / TELEGRAM_CHAT_ID no configurados'
+        }
+
     payload = {
         'chat_id':    TELEGRAM_CHAT_ID,
         'text':       text[:4096],
@@ -222,6 +229,11 @@ def tg_send(text: str, reply_markup=None) -> dict:
     except Exception as e:
         print(f"[TG ERROR] {e}")
         return {}
+
+
+def _tg_ok(resp: dict) -> bool:
+    """Normaliza respuesta de Telegram para saber si el envío fue exitoso."""
+    return isinstance(resp, dict) and bool(resp.get('ok'))
 
 
 def tg_edit(chat_id, message_id, text: str) -> None:
@@ -892,8 +904,8 @@ def check_portfolio_exits() -> list[dict]:
 # MENSAJES DE ALERTA
 # ══════════════════════════════════════════════════════════════════
 
-def send_buy_alert(signal: dict) -> None:
-    """Envía alerta de compra con botones inline."""
+def send_buy_alert(signal: dict) -> bool:
+    """Envía alerta de compra con botones inline. Retorna True si Telegram confirmó entrega."""
     t   = signal['ticker']
     pr  = signal['price']
     ind = signal['indicadores']
@@ -959,12 +971,18 @@ def send_buy_alert(signal: dict) -> None:
     # Guardar datos completos en archivo temporal para recuperar en callback
     _save_pending_buy(t, signal)
 
-    tg_send(text, reply_markup=markup)
-    print(f"[ALERT BUY] {t} @ AUD {pr:.3f}  prob={signal['prob']:.1%}")
+    resp = tg_send(text, reply_markup=markup)
+    if _tg_ok(resp):
+        print(f"[ALERT BUY] {t} @ AUD {pr:.3f}  prob={signal['prob']:.1%}")
+        return True
+
+    desc = resp.get('description', 'sin detalle') if isinstance(resp, dict) else 'sin respuesta JSON'
+    print(f"[ALERT BUY ERROR] {t} no enviada. Motivo: {desc}")
+    return False
 
 
-def send_sell_alert(exit_info: dict) -> None:
-    """Envía alerta de venta con botones inline."""
+def send_sell_alert(exit_info: dict) -> bool:
+    """Envía alerta de venta con botones inline. Retorna True si Telegram confirmó entrega."""
     t         = exit_info['ticker']
     razon     = exit_info['razon']
     price_now = exit_info['price_now']
@@ -1008,8 +1026,14 @@ def send_sell_alert(exit_info: dict) -> None:
             {'text': '🔄 Mantener', 'callback_data': callback_hold},
         ]]
     }
-    tg_send(text, reply_markup=markup)
-    print(f"[ALERT SELL] {t} @ AUD {price_now:.3f}  {razon}  P&L {pnl_aud:+.2f}")
+    resp = tg_send(text, reply_markup=markup)
+    if _tg_ok(resp):
+        print(f"[ALERT SELL] {t} @ AUD {price_now:.3f}  {razon}  P&L {pnl_aud:+.2f}")
+        return True
+
+    desc = resp.get('description', 'sin detalle') if isinstance(resp, dict) else 'sin respuesta JSON'
+    print(f"[ALERT SELL ERROR] {t} no enviada. Motivo: {desc}")
+    return False
 
 
 # ── Pending buy cache (para recuperar datos completos en callback) ─
@@ -1266,12 +1290,15 @@ def run_exit_monitor() -> None:
 
     now = datetime.now()
     print(f"\n[MONITOR] {now.strftime('%Y-%m-%d %H:%M')} — {len(portfolio)} posición(es) activa(s)")
+    if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
+        print("[MONITOR WARN] Telegram no configurado: se evaluarán salidas pero no se podrán entregar alertas.")
 
     exits = check_portfolio_exits()
+    sent_sell = 0
     if exits:
         for ex in exits:
-            send_sell_alert(ex)
-        print(f"[MONITOR] {len(exits)} alerta(s) de venta enviada(s)")
+            sent_sell += 1 if send_sell_alert(ex) else 0
+        print(f"[MONITOR] {sent_sell}/{len(exits)} alerta(s) de venta entregada(s) por Telegram")
     else:
         # Mostrar estado breve de cada posición
         start = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
@@ -1297,6 +1324,8 @@ def run_scan(capital: float = CAPITAL_DEFAULT, force: bool = False) -> None:
     print(f"\n{'='*55}")
     print(f"  TitanBrain LIVE ALERTS — {now.strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*55}")
+    if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
+        print("[WARN] Telegram no configurado: se detectarán señales, pero no se entregarán alertas.")
 
     if not force and not is_market_relevant():
         print(f"[INFO] Fuera de horario de mercado ({now.strftime('%A %H:%M')}). Saltando scan.")
@@ -1306,8 +1335,9 @@ def run_scan(capital: float = CAPITAL_DEFAULT, force: bool = False) -> None:
     # 1. Chequear posiciones abiertas (prioridad)
     print("\n[1/2] Chequeando portfolio abierto...")
     exits = check_portfolio_exits()
+    sent_sell = 0
     for ex in exits:
-        send_sell_alert(ex)
+        sent_sell += 1 if send_sell_alert(ex) else 0
     if not exits:
         pf = load_portfolio()
         if pf:
@@ -1318,8 +1348,9 @@ def run_scan(capital: float = CAPITAL_DEFAULT, force: bool = False) -> None:
     # 2. Scan nuevas señales de compra
     print("\n[2/2] Escaneando señales de compra...")
     signals, near_misses = scan_buy_signals(capital=capital)
+    sent_buy = 0
     for sig in signals:
-        send_buy_alert(sig)
+        sent_buy += 1 if send_buy_alert(sig) else 0
 
     if not signals and not exits:
         print("\n[INFO] Sin señales hoy — top candidatos por probabilidad:")
@@ -1345,8 +1376,13 @@ def run_scan(capital: float = CAPITAL_DEFAULT, force: bool = False) -> None:
             print("  Sin candidatos con prob ≥ 28% en el universo de hoy.")
         return
 
-    total = len(signals) + len(exits)
-    print(f"\n[OK] {total} alerta(s) enviada(s): {len(signals)} compra(s), {len(exits)} venta(s)")
+    total_candidates = len(signals) + len(exits)
+    total_sent = sent_buy + sent_sell
+    if total_sent == total_candidates:
+        print(f"\n[OK] {total_sent} alerta(s) entregada(s): {sent_buy} compra(s), {sent_sell} venta(s)")
+    else:
+        print(f"\n[WARN] Entrega parcial: {total_sent}/{total_candidates} alerta(s) entregada(s)")
+        print(f"       Compras: {sent_buy}/{len(signals)} | Ventas: {sent_sell}/{len(exits)}")
 
 
 if __name__ == '__main__':
