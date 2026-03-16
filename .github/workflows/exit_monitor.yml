@@ -72,13 +72,13 @@ jobs:
           echo "empty=$EMPTY" >> $GITHUB_OUTPUT
 
       - name: Saltar si portfolio vacío
-        if: steps.check-portfolio.outputs.empty == 'true' && steps.restore-state.outputs.cache-hit == 'true'
+        if: steps.check-portfolio.outputs.empty == 'true' && steps.restore-state.outputs.cache-matched-key != ''
         run: |
           echo "✅ Portfolio vacío — nada que monitorear. Job terminado."
           exit 0
 
       - name: Fallar si se perdió estado (cache miss + portfolio vacío)
-        if: steps.restore-state.outputs.cache-hit != 'true' && steps.check-portfolio.outputs.empty == 'true'
+        if: steps.restore-state.outputs.cache-matched-key == '' && steps.check-portfolio.outputs.empty == 'true'
         run: |
           echo "❌ Cache miss y portfolio vacío: se perdió estado privado (current_portfolio/trade_history)."
           echo "❌ Rehidrata estado antes de continuar para no perder monitoreo de salidas."
