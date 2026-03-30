@@ -8,15 +8,7 @@
 name: TitanBrain — Buy Scan Diario
 
 on:
-  schedule:
-    - cron: '15 23 * * 0-4'   # 23:15 UTC Dom-Jue  = 10:15 AEDT Lun-Vie (verano AU)
-    - cron: '15 0  * * 1-5'   # 00:15 UTC Lun-Vie  = 10:15 AEST Lun-Vie (invierno AU)
-  workflow_dispatch:            # también permite correrlo manualmente desde GitHub
-    inputs:
-      force:
-        description: 'Forzar aunque sea fin de semana'
-        type: boolean
-        default: false
+  workflow_dispatch:            # Solo trigger manual desde GitHub UI
 
 jobs:
   buy-scan:

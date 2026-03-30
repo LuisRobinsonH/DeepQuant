@@ -8,18 +8,7 @@
 name: TitanBrain — Exit Monitor (15min)
 
 on:
-  schedule:
-    # Cada 15 min — ventana 22:30 a 06:00 UTC (cubre AEDT y AEST)
-    - cron: '0,15,30,45 22 * * 0-4'   # 22:xx UTC Dom-Jue
-    - cron: '0,15,30,45 23 * * 0-4'   # 23:xx UTC Dom-Jue  ← apertura AEDT
-    - cron: '0,15,30,45  0 * * 1-5'   # 00:xx UTC Lun-Vie  ← apertura AEST
-    - cron: '0,15,30,45  1 * * 1-5'   # 01:xx UTC Lun-Vie
-    - cron: '0,15,30,45  2 * * 1-5'   # 02:xx UTC Lun-Vie
-    - cron: '0,15,30,45  3 * * 1-5'   # 03:xx UTC Lun-Vie
-    - cron: '0,15,30,45  4 * * 1-5'   # 04:xx UTC Lun-Vie
-    - cron: '0,15,30,45  5 * * 1-5'   # 05:xx UTC Lun-Vie  ← cierre AEDT
-    - cron: '0,15,30,45  6 * * 1-5'   # 06:xx UTC Lun-Vie  ← cierre AEST
-  workflow_dispatch:                    # trigger manual desde GitHub UI
+  workflow_dispatch:                    # Solo trigger manual desde GitHub UI
 
 jobs:
   exit-monitor:
