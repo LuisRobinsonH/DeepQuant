@@ -1,0 +1,90 @@
+{
+  "window_start": "2026-02-23",
+  "window_end": "2026-03-16",
+  "buy_alert_count": 0,
+  "sell_alert_count": 0,
+  "buy_alerts": [],
+  "sell_alerts": [],
+  "portfolio_counts": [
+    {
+      "date": "2026-02-23",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-02-24",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-02-25",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-02-26",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-02-27",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-02",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-03",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-04",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-05",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-06",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-09",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-10",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-11",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-12",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-13",
+      "count": 0,
+      "tickers": []
+    },
+    {
+      "date": "2026-03-16",
+      "count": 0,
+      "tickers": []
+    }
+  ]
+}

@@ -29,13 +29,11 @@ import os
 import sys
 import warnings
 from datetime import datetime
-from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, brier_score_loss
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
 
 warnings.filterwarnings('ignore')
 
@@ -45,10 +43,14 @@ warnings.filterwarnings('ignore')
 START_DATE       = "2020-01-01"
 N_SPLITS         = 5         # Folds walk-forward
 MIN_TRAIN_ROWS   = 300       # Mínimo filas de entrenamiento por fold
-PROB_THRESHOLD   = 0.48      # Umbral para generar señal (igual que orchestrator)
-TP_PCT           = 0.10      # Take profit por operación
-SL_PCT           = 0.05      # Stop loss por operación
-HOLD_DAYS        = 10        # Días máximos de holding si no se toca TP ni SL
+PROB_THRESHOLD   = 0.52      # Umbral por defecto alineado con V37
+SL_ATR           = 2.5       # Stop = entrada - 2.5*ATR
+BE_TRIGGER_ATR   = 1.5       # Trigger de breakeven
+TP1_PCT          = 0.09      # Referencia V37
+TP2_PCT          = 0.22      # Salida objetivo final V37
+MAX_HOLD_DAYS    = 35
+MACD_MIN_PROFIT  = 0.01
+MACD_MIN_PROFIT_BE = 0.005
 START_CAPITAL    = 1000.0    # Capital virtual para curva de equity
 
 
@@ -70,45 +72,84 @@ def get_feature_cols(df):
     return [f for f in CANDIDATE_FEATURES if f in df.columns]
 
 
-def build_model():
-    """Construye el ensemble calibrado idéntico al usado en producción."""
-    lr_pipe = Pipeline([
-        ('scaler', StandardScaler()),
-        ('lr', LogisticRegression(C=0.5, solver='liblinear', random_state=42))
-    ])
+def build_model(seed=42):
+    """Replica el ensemble calibrado del pipeline de entrenamiento principal."""
     rf = RandomForestClassifier(
-        n_estimators=100, max_depth=5, min_samples_leaf=10,
-        random_state=42, n_jobs=-1
+        n_estimators=200,
+        max_depth=8,
+        min_samples_leaf=2,
+        min_samples_split=5,
+        class_weight='balanced_subsample',
+        random_state=seed,
+        n_jobs=-1,
     )
+    rf_calibrated = CalibratedClassifierCV(rf, method='isotonic', cv=5)
+
+    lr = LogisticRegression(
+        C=0.5,
+        class_weight='balanced',
+        random_state=seed,
+        max_iter=1000,
+    )
+    lr_calibrated = CalibratedClassifierCV(lr, method='sigmoid', cv=5)
+
     gb = GradientBoostingClassifier(
-        n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42
+        n_estimators=100,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        random_state=seed,
     )
-    ensemble = VotingClassifier(
-        estimators=[('rf', rf), ('lr', lr_pipe), ('gb', gb)],
-        voting='soft'
+
+    return VotingClassifier(
+        estimators=[('rf', rf_calibrated), ('lr', lr_calibrated), ('gb', gb)],
+        voting='soft',
+        weights=[0.40, 0.35, 0.25],
     )
-    try:
-        return CalibratedClassifierCV(ensemble, method='isotonic', cv=3)
-    except Exception:
-        return CalibratedClassifierCV(ensemble, method='sigmoid', cv=3)
 
 
 def simulate_trade(test_df, entry_idx, entry_price):
     """
-    Simula una operación desde entry_idx hasta TP, SL o HOLD_DAYS.
+    Simula una operación con lógica de salida alineada a V37.
     Retorna (exit_price, outcome, pnl_pct).
     """
-    for j in range(1, min(HOLD_DAYS + 1, len(test_df) - entry_idx)):
-        future_price = test_df['close'].iloc[entry_idx + j]
-        ret = (future_price - entry_price) / entry_price
-        if ret >= TP_PCT:
-            return entry_price * (1 + TP_PCT), 'TAKE_PROFIT', TP_PCT
-        elif ret <= -SL_PCT:
-            return entry_price * (1 - SL_PCT), 'STOP_LOSS', -SL_PCT
-    # Expiró el holding máximo
-    exit_price = test_df['close'].iloc[min(entry_idx + HOLD_DAYS, len(test_df) - 1)]
+    atr = float(test_df['atr'].iloc[entry_idx]) if 'atr' in test_df.columns else entry_price * 0.02
+    if not np.isfinite(atr) or atr <= 0:
+        atr = entry_price * 0.02
+
+    stop_price = entry_price - SL_ATR * atr
+    be_price = entry_price + BE_TRIGGER_ATR * atr
+    breakeven_active = False
+
+    horizon = min(MAX_HOLD_DAYS + 1, len(test_df) - entry_idx)
+    for j in range(1, horizon):
+        idx = entry_idx + j
+        future_price = float(test_df['close'].iloc[idx])
+        pnl = (future_price - entry_price) / entry_price
+
+        if (not breakeven_active) and future_price >= be_price:
+            stop_price = max(stop_price, entry_price)
+            breakeven_active = True
+
+        if future_price <= stop_price:
+            stop_pnl = (stop_price - entry_price) / entry_price
+            return stop_price, 'STOP_LOSS', stop_pnl
+
+        if pnl >= TP2_PCT:
+            return entry_price * (1 + TP2_PCT), 'TAKE_PROFIT', TP2_PCT
+
+        if 'macd_diff' in test_df.columns and idx > 0:
+            prev_macd = float(test_df['macd_diff'].iloc[idx - 1])
+            curr_macd = float(test_df['macd_diff'].iloc[idx])
+            macd_invertido = prev_macd > 0 and curr_macd < 0
+            min_profit = MACD_MIN_PROFIT_BE if breakeven_active else MACD_MIN_PROFIT
+            if macd_invertido and pnl >= min_profit:
+                return future_price, 'MACD_INVERTIDO', pnl
+
+    exit_idx = min(entry_idx + MAX_HOLD_DAYS, len(test_df) - 1)
+    exit_price = float(test_df['close'].iloc[exit_idx])
     pnl = (exit_price - entry_price) / entry_price
-    return exit_price, 'EXPIRE', pnl
+    return exit_price, 'MAX_DIAS', pnl
 
 
 def validate_ticker(ticker, df, brain_instance):
@@ -185,7 +226,7 @@ def validate_ticker(ticker, df, brain_instance):
                         'win':         1 if pnl_pct > 0 else 0,
                     })
                     # Saltar los días de holding para no solapar operaciones
-                    i += HOLD_DAYS
+                    i += MAX_HOLD_DAYS
                     continue
             i += 1
 
@@ -206,10 +247,58 @@ def equity_metrics(pnl_series):
     return sharpe, max_dd, eq.iloc[-1]
 
 
+def expected_calibration_error(y_true, y_prob, n_bins=10):
+    """ECE simple para medir descalibración de probabilidades."""
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.digitize(y_prob, bins, right=True) - 1
+    bin_ids = np.clip(bin_ids, 0, n_bins - 1)
+
+    ece = 0.0
+    n = len(y_true)
+    if n == 0:
+        return 0.0
+    for b in range(n_bins):
+        mask = bin_ids == b
+        if not np.any(mask):
+            continue
+        acc = y_true[mask].mean()
+        conf = y_prob[mask].mean()
+        ece += (mask.sum() / n) * abs(acc - conf)
+    return float(ece)
+
+
+def population_stability_index(reference, current, bins=10):
+    """PSI para cuantificar drift de distribución de probabilidad."""
+    reference = np.asarray(reference)
+    current = np.asarray(current)
+    if len(reference) == 0 or len(current) == 0:
+        return 0.0
+
+    quantiles = np.linspace(0.0, 1.0, bins + 1)
+    edges = np.quantile(reference, quantiles)
+    edges = np.unique(edges)
+    if len(edges) < 3:
+        edges = np.linspace(0.0, 1.0, bins + 1)
+
+    ref_hist, _ = np.histogram(reference, bins=edges)
+    cur_hist, _ = np.histogram(current, bins=edges)
+
+    eps = 1e-6
+    ref_pct = ref_hist / max(ref_hist.sum(), 1) + eps
+    cur_pct = cur_hist / max(cur_hist.sum(), 1) + eps
+    return float(np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct)))
+
+
 def run_validation(tickers=None, start_date=START_DATE):
     print("\n" + "=" * 70)
     print("🔬  TITAN AI — WALK-FORWARD VALIDATION")
-    print(f"    Parámetros: prob≥{PROB_THRESHOLD} | TP={TP_PCT:.0%} | SL={SL_PCT:.0%} | hold={HOLD_DAYS}d")
+    print(
+        f"    Parámetros: prob≥{PROB_THRESHOLD:.2f} | "
+        f"SL_ATR={SL_ATR:.1f} | BE_ATR={BE_TRIGGER_ATR:.1f} | "
+        f"TP2={TP2_PCT:.0%} | hold={MAX_HOLD_DAYS}d"
+    )
     print("=" * 70)
 
     from core.brain import TitanBrain
@@ -301,6 +390,14 @@ def run_validation(tickers=None, start_date=START_DATE):
         global_auc = roc_auc_score(pred_df['actual'], pred_df['prob'])
     except Exception:
         global_auc = 0.5
+    global_brier = brier_score_loss(pred_df['actual'], pred_df['prob'])
+    global_ece = expected_calibration_error(pred_df['actual'], pred_df['prob'])
+
+    pred_sorted = pred_df.sort_values('date')
+    mid = len(pred_sorted) // 2
+    probs_ref = pred_sorted['prob'].iloc[:mid].values
+    probs_cur = pred_sorted['prob'].iloc[mid:].values
+    global_psi = population_stability_index(probs_ref, probs_cur) if mid > 100 else 0.0
 
     total_signals = int(pred_df['pred'].sum())
     total_rows    = len(pred_df)
@@ -310,6 +407,9 @@ def run_validation(tickers=None, start_date=START_DATE):
     print("📊  MÉTRICAS GLOBALES  (Out-of-Sample Walk-Forward)")
     print(f"{'─'*60}")
     print(f"   AUC ROC:              {global_auc:.4f}   {_auc_badge(global_auc)}")
+    print(f"   Brier Score:          {global_brier:.4f}   {'🟢' if global_brier <= 0.20 else '🟡' if global_brier <= 0.25 else '🔴'}")
+    print(f"   ECE (10 bins):        {global_ece:.4f}   {'🟢' if global_ece <= 0.05 else '🟡' if global_ece <= 0.10 else '🔴'}")
+    print(f"   PSI (1ra vs 2da mitad): {global_psi:.4f}   {'🟢' if global_psi < 0.10 else '🟡' if global_psi < 0.25 else '🔴'}")
     print(f"   Precisión:            {global_prec:.4f}")
     print(f"   Recall:               {global_rec:.4f}")
     print(f"   F1 Score:             {global_f1:.4f}")
@@ -406,22 +506,27 @@ def run_validation(tickers=None, start_date=START_DATE):
         elif win_rate > 0.60:
             print("   ✅  Win Rate sólido. Puedes probar bajar PROB_THRESHOLD para más señales.")
         if sharpe < 0.5:
-            print("   ⚠️  Sharpe bajo: revisa el ratio TP/SL (actual TP={:.0%} SL={:.0%})".format(TP_PCT, SL_PCT))
+            print("   ⚠️  Sharpe bajo: revisa filtros de entrada o sube PROB_THRESHOLD (0.53-0.56)")
         if max_dd > 0.25:
             print("   🛑  Max Drawdown alto: añade filtro de régimen de mercado (solo operar en BULL)")
         if signal_rate < 0.02:
             print("   📉  Muy pocas señales ({:.1%}): baja PROB_THRESHOLD o revisa el target en engineer_features".format(signal_rate))
+    if global_ece > 0.10:
+        print("   🎯 Calibración floja: reentrena calibrador (isotonic/sigmoid) con ventana más reciente")
+    if global_psi >= 0.25:
+        print("   🌊 Drift alto: reentrena con más peso a datos recientes o segmenta por régimen")
 
     # ──────────────────────────────────────────
     # GUARDAR RESULTADOS EN EXCEL
     # ──────────────────────────────────────────
     output_file = f"validation_results_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
     summary_data = {
-        'Metrica': ['AUC ROC', 'Precisión', 'Recall', 'F1', 'Total Señales', 'Tasa Señal',
+        'Metrica': ['AUC ROC', 'Brier Score', 'ECE', 'PSI', 'Precisión', 'Recall', 'F1', 'Total Señales', 'Tasa Señal',
                     'Win Rate', 'Avg PnL/Operación', 'Sharpe', 'Max Drawdown',
                     'Total Operaciones', 'Capital Final'],
         'Valor': [
-            f"{global_auc:.4f}", f"{global_prec:.4f}", f"{global_rec:.4f}", f"{global_f1:.4f}",
+            f"{global_auc:.4f}", f"{global_brier:.4f}", f"{global_ece:.4f}", f"{global_psi:.4f}",
+            f"{global_prec:.4f}", f"{global_rec:.4f}", f"{global_f1:.4f}",
             str(total_signals), f"{signal_rate:.2%}",
             f"{win_rate:.2%}"  if not trades_df.empty else 'N/A',
             f"{avg_pnl:+.2%}" if not trades_df.empty else 'N/A',
@@ -475,14 +580,20 @@ if __name__ == "__main__":
                         help=f'Fecha de inicio (default: {START_DATE})')
     parser.add_argument('--prob', type=float, default=PROB_THRESHOLD,
                         help=f'Umbral de probabilidad (default: {PROB_THRESHOLD})')
-    parser.add_argument('--tp', type=float, default=TP_PCT,
-                        help=f'Take profit %% (default: {TP_PCT})')
-    parser.add_argument('--sl', type=float, default=SL_PCT,
-                        help=f'Stop loss %% (default: {SL_PCT})')
+    parser.add_argument('--sl-atr', type=float, default=SL_ATR,
+                        help=f'Stop en ATR (default: {SL_ATR})')
+    parser.add_argument('--be-atr', type=float, default=BE_TRIGGER_ATR,
+                        help=f'Break-even trigger en ATR (default: {BE_TRIGGER_ATR})')
+    parser.add_argument('--tp2', type=float, default=TP2_PCT,
+                        help=f'Take profit final %% (default: {TP2_PCT})')
+    parser.add_argument('--max-hold', type=int, default=MAX_HOLD_DAYS,
+                        help=f'Días máximos de holding (default: {MAX_HOLD_DAYS})')
     args = parser.parse_args()
 
     PROB_THRESHOLD = args.prob
-    TP_PCT         = args.tp
-    SL_PCT         = args.sl
+    SL_ATR         = args.sl_atr
+    BE_TRIGGER_ATR = args.be_atr
+    TP2_PCT        = args.tp2
+    MAX_HOLD_DAYS  = args.max_hold
 
     run_validation(tickers=args.tickers, start_date=args.start)
